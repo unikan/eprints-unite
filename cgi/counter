@@ -1,0 +1,141 @@
+######################################################################
+#
+#  Show the number of eprints currently in the repository
+#
+#  Used for remote monitoring of repository growth. eg. by 
+#  software.eprints.org
+#
+######################################################################
+#
+#  __COPYRIGHT__
+#
+# Copyright 2000-2008 University of Southampton. All Rights Reserved.
+# 
+#  __LICENSE__
+#
+######################################################################
+
+use EPrints;
+use JSON;
+
+
+use strict;
+
+my $eprints = EPrints->new;
+my $repo = $eprints->current_repository;
+exit( 0 ) unless( defined $repo );
+
+my $use_json = $repo->get_request->path_info =~ /\.json$/;
+
+my %data;
+
+my %counts;
+foreach my $ds_id ($repo->get_sql_dataset_ids)
+{
+	my $ds = $repo->dataset( $ds_id );
+	my $table = $ds->get_sql_table_name;
+	$counts{$ds_id} = $repo->get_database->quick_count_table( $table );
+}
+{
+	my $ds = $repo->dataset( "eprint" );
+	my $search = $ds->prepare_search;
+	my @counts = $search->perform_groupby( $ds->field( "eprint_status" ) );
+	foreach my $i (0..$#{$counts[0]})
+	{
+		next if exists $counts{$counts[0]->[$i]};
+		$counts{$counts[0]->[$i]} = $counts[1]->[$i];
+	}
+	for(qw( inbox buffer archive deletion ))
+	{
+		$counts{$_} ||= 0;
+	}
+}
+$data{counts} = \%counts;
+
+# version
+$data{version} = EPrints->human_version;
+
+# Indexer Status
+my $daemon = EPrints::Index::Daemon->new(
+		session => $repo,
+		logfile => EPrints::Index::logfile(),
+		noise => ($repo->{noise}||1),
+);
+
+my $status = "not-running";
+$status = "running" if $daemon->is_running();
+$status = "stalled" if $daemon->has_stalled();
+$data{indexer} = $status;
+
+my %epm;
+$repo->dataset( 'epm' )->dataobj_class->map($repo, sub {
+	my( undef, undef, $epm ) = @_;
+
+	$epm{$epm->value("epmid")} = $epm->value("version");
+});
+$data{epm} = \%epm;
+
+if ($use_json) {
+	$repo->send_http_header( content_type=>"application/json; charset=UTF-8" );
+	&application_json(%data);
+}
+else {
+	$repo->send_http_header( content_type=>"text/plain; charset=UTF-8" );
+	&plain_text(%data);
+}
+
+exit;
+
+sub plain_text
+{
+	my %data = @_;
+
+	foreach my $ds_id ( sort keys %{$data{counts}} )
+	{
+		print sprintf("%s: %i\n",
+			$ds_id,
+			$data{counts}{$ds_id}
+		);
+	}
+
+	print sprintf("version: %s\n", $data{version});
+	print sprintf("indexer: %s\n", $data{indexer});
+
+	print "epm: ";
+	my $first = 1;
+	foreach my $epm_id ( sort keys %{$data{epm}} )
+	{
+		print "; " if !$first;
+		$first = 0;
+
+		print sprintf("%s=%s", $epm_id, $data{epm}{$epm_id});
+	}
+	print "\n";
+}
+
+sub application_json
+{
+	my %data = @_;
+
+	my $jsonp;
+	for($repo->param)
+	{
+		if (/^json|jsonp|callback$/) {
+			$jsonp = $repo->param($_);
+			$jsonp =~ s/[^=A-Za-z0-9_]//g;
+			last;
+		}
+	}
+
+	if( $jsonp )
+	{
+		print "$jsonp(";
+	}
+
+	print JSON->new->pretty->canonical->encode( \%data );
+
+	if( $jsonp )
+	{
+		print ");";
+	}
+}
